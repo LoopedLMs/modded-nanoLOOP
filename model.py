@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 from torch import Tensor, nn
 
 # ---------------------------------------------------------------------------
@@ -91,10 +92,11 @@ class ReLUSquaredMLP(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    """Standard multi-head causal self-attention.
+    """Multi-head causal self-attention using FlashAttention 2.
 
-    Uses PyTorch's ``scaled_dot_product_attention`` which dispatches to
-    FlashAttention 2 on A100 or the math backend as fallback.
+    Uses ``flash_attn_func`` which is optimised for A100 (SM80) and avoids
+    the overhead of PyTorch SDPA dispatch.  flash_attn_func takes tensors
+    in (B, T, H, D) layout directly — no transposes needed.
 
     Weights are passed in via forward() (from the parameter bank).
     """
@@ -117,15 +119,10 @@ class CausalSelfAttention(nn.Module):
         # QK-norm (stabilises training, allows higher LR)
         q, k = norm(q), norm(k)
 
-        # (B, T, H, D) → (B, H, T, D) for SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # FlashAttention 2 — takes (B, T, H, D) directly, returns (B, T, H, D)
+        y = flash_attn_func(q, k, v, causal=True, softmax_scale=self.scale)
 
-        # SDPA dispatches to FlashAttention 2 on A100
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
-
-        y = y.transpose(1, 2).contiguous().view(B, T, self.model_dim)
+        y = y.reshape(B, T, self.model_dim)
         y = F.linear(y, o_w)
         return y
 

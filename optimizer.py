@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 
-from triton_kernels import XTX, XXT, ba_plus_cAA
+from kernels_triton import XTX, XXT, ba_plus_cAA
 
 # ---------------------------------------------------------------------------
 # Polar Express orthogonalization
