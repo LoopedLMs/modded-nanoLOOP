@@ -1147,10 +1147,40 @@ class ForwardScheduleConfig:
     ws_long: int
     train_max_seq_len: int
 
+
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        model_dim: int,
+        max_seq_len: int,
+        n_loop: int = 1,
+        recur_start: int = 0,
+        recur_end: int = 0,
+        bptt_k: int | None = None,
+        input_injection: str = "passthrough",
+    ):
         super().__init__()
         self.num_layers = num_layers
+
+        # Looped transformer config
+        assert 0 <= recur_start <= recur_end <= num_layers, (
+            f"Invalid recur range [{recur_start}, {recur_end}) for {num_layers} layers"
+        )
+        assert n_loop >= 1, f"n_loop must be >= 1, got {n_loop}"
+        assert input_injection in ("inject", "inject_random", "passthrough"), (
+            f"Unknown input_injection mode: {input_injection}"
+        )
+        if n_loop > 1:
+            assert recur_end > recur_start, "n_loop > 1 requires non-empty recur block"
+        self.n_loop = n_loop
+        self.recur_start = recur_start
+        self.recur_end = recur_end
+        self.bptt_k = bptt_k
+        self.input_injection = input_injection
         self.vocab_size = next_multiple_of_n(vocab_size, n=128)
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
@@ -1250,6 +1280,18 @@ class GPT(nn.Module):
                 ]
             )
         )
+        # Looped transformer modules (only created if looping is active)
+        if self.n_loop > 1:
+            # Input injection: projects concat(prelude_output, state) back to model_dim
+            # Initialized as [I | 0] so inject(cat(e, s)) ≈ e at init
+            if self.input_injection in ("inject", "inject_random"):
+                self.inject = nn.Linear(2 * model_dim, model_dim, bias=False)
+                with torch.no_grad():
+                    self.inject.weight.zero_()
+                    self.inject.weight[:model_dim, :model_dim].copy_(torch.eye(model_dim))
+            # Norm after each recurrence iteration to prevent activation blowup
+            self.norm_recur = nn.RMSNorm(model_dim, elementwise_affine=True)
+
         # Auto-label parameters
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
@@ -1319,8 +1361,15 @@ class GPT(nn.Module):
         # Layer 0: bigram already injected above, so only x0 component
         x0_inject = (x0 * x0_lambdas[0],) + tuple(x0 * x0_lambdas[i] + x0_bigram * bigram_lambdas[i] for i in range(1, self.num_layers))
 
-        # ---- Transformer layers ----
-        for i in range(self.num_layers):
+        # ---- Transformer layers (prelude → recur ×n_loop → coda) ----
+        # All control flow uses Python ints → static for torch.compile
+        recur_start = self.recur_start
+        recur_end = self.recur_end
+        n_loop = self.n_loop
+        has_recurrence = n_loop > 1
+
+        # 1. Prelude: layers [0, recur_start) — run once
+        for i in range(recur_start):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
                 ve=ve[i],
@@ -1331,42 +1380,30 @@ class GPT(nn.Module):
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i],
-                train_max_seq_len=train_max_seq_len
+                train_max_seq_len=train_max_seq_len,
             )
-            # Select weights from banks
             qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
-
-            # Introduce lane1 at parallel_start by copying lane0
             if i == self.parallel_start:
                 lane1 = lane0
-
-            # Skip connection injection
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
                 skip_val = skip_connections.pop()
                 lane0 = lane0 + skip_gate_out * skip_val
                 if lane1 is not None:
                     lane1 = lane1 + skip_gate_out * skip_val
-
-            # Select attention variant for this layer
             attn = self.attn_paired if i in self.paired_head_layers else self.attn
-
-            # Dispatch based on layer type
             post_attn = None
             if i == 6:
-                # MLP-only layer (no attention) @YouJiacheng
                 post_attn = lane0
                 lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
             elif i < self.parallel_start:
-                # Single-stream: attn and mlp both read/write lane0
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
                 post_attn = lane0
                 lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
             else:
-                # Parallel: attn reads lane0, mlp reads lane1, both write to both lanes
                 attn_out = attn(norm(lane0), attn_args, qkvo_w)
                 lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
                 lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
@@ -1374,8 +1411,141 @@ class GPT(nn.Module):
                 mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
                 lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
                 lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
+            if i in skip_in:
+                skip_connections.append(post_attn)
+            if i == backout_layer:
+                x_backout = lane0
 
-            # Skip connection and backout bookkeeping
+        # Save prelude output for input injection
+        if has_recurrence:
+            e_lane0 = lane0
+
+        # 2. Recurrence: layers [recur_start, recur_end) × n_loop
+        # Note: skip_in=[3] and skip_out=[6] must both be within the recur range for
+        # correct skip connection behavior across iterations.
+        for loop_iter in range(n_loop):
+            if has_recurrence:
+                # State initialization (first iteration only)
+                if loop_iter == 0:
+                    if self.input_injection == "inject_random":
+                        s_lane0 = torch.randn_like(lane0) * (lane0.size(-1) ** -0.5)
+                    else:
+                        s_lane0 = lane0  # both "inject" and "passthrough" start from prelude output
+                # Input injection
+                if self.input_injection in ("inject", "inject_random"):
+                    lane0 = self.inject(torch.cat([e_lane0, s_lane0], dim=-1))
+                else:  # passthrough
+                    lane0 = s_lane0
+                # Reset skip connections for each iteration (self-contained within recur block)
+                skip_connections = []
+
+            for i in range(recur_start, recur_end):
+                yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
+                attn_args = AttnArgs(
+                    ve=ve[i],
+                    sa_lambdas=sa_lambdas[i],
+                    seqlens=seqlens,
+                    bm_size=bm_sizes[i],
+                    yarn=yarn,
+                    key_offset=key_offset[i],
+                    attn_gate_w=attn_gates[i],
+                    ve_gate_w=ve_gates[i],
+                    train_max_seq_len=train_max_seq_len,
+                )
+                qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
+                c_fc = mlp_fcs[i]
+                c_proj = mlp_projs[i]
+                if i == self.parallel_start:
+                    lane1 = lane0
+                if i in skip_out:
+                    skip_gate_out = (
+                        torch.sigmoid(skip_lambda)
+                        * 2
+                        * torch.sigmoid(self.skip_gate(x0[..., : self.skip_gate.weight.size(-1)]))
+                    )
+                    skip_val = skip_connections.pop()
+                    lane0 = lane0 + skip_gate_out * skip_val
+                    if lane1 is not None:
+                        lane1 = lane1 + skip_gate_out * skip_val
+                attn = self.attn_paired if i in self.paired_head_layers else self.attn
+                post_attn = None
+                if i == 6:
+                    post_attn = lane0
+                    lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+                elif i < self.parallel_start:
+                    attn_out = attn(norm(lane0), attn_args, qkvo_w)
+                    lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
+                    post_attn = lane0
+                    lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+                else:
+                    attn_out = attn(norm(lane0), attn_args, qkvo_w)
+                    lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
+                    lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
+                    post_attn = lane0
+                    mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
+                    lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
+                    lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
+                if i in skip_in:
+                    skip_connections.append(post_attn)
+                if i == backout_layer:
+                    x_backout = lane0
+
+            # Post-recurrence: normalize to prevent activation blowup
+            if has_recurrence:
+                s_lane0 = self.norm_recur(lane0)
+                # Truncated BPTT: detach gradients for early iterations
+                if self.bptt_k is not None and loop_iter < n_loop - self.bptt_k:
+                    s_lane0 = s_lane0.detach()
+
+        # Set lane0 from final recurrent state for coda
+        if has_recurrence:
+            lane0 = s_lane0
+
+        # 3. Coda: layers [recur_end, num_layers) — run once
+        for i in range(recur_end, self.num_layers):
+            yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
+            attn_args = AttnArgs(
+                ve=ve[i],
+                sa_lambdas=sa_lambdas[i],
+                seqlens=seqlens,
+                bm_size=bm_sizes[i],
+                yarn=yarn,
+                key_offset=key_offset[i],
+                attn_gate_w=attn_gates[i],
+                ve_gate_w=ve_gates[i],
+                train_max_seq_len=train_max_seq_len,
+            )
+            qkvo_w = attn_weights[i - (i > 6)] if i != 6 else None
+            c_fc = mlp_fcs[i]
+            c_proj = mlp_projs[i]
+            if i == self.parallel_start:
+                lane1 = lane0
+            if i in skip_out:
+                skip_gate_out = (
+                    torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., : self.skip_gate.weight.size(-1)]))
+                )
+                skip_val = skip_connections.pop()
+                lane0 = lane0 + skip_gate_out * skip_val
+                if lane1 is not None:
+                    lane1 = lane1 + skip_gate_out * skip_val
+            attn = self.attn_paired if i in self.paired_head_layers else self.attn
+            post_attn = None
+            if i == 6:
+                post_attn = lane0
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+            elif i < self.parallel_start:
+                attn_out = attn(norm(lane0), attn_args, qkvo_w)
+                lane0 = resid_lambdas_attn[i] * lane0 + attn_out + x0_inject[i]
+                post_attn = lane0
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * ReLUSqrdMLP(norm(lane0), c_fc, c_proj)
+            else:
+                attn_out = attn(norm(lane0), attn_args, qkvo_w)
+                lane0 = resid_lambdas_attn[i] * lane0 + post_lambdas_attn_ln0[i] * attn_out + x0_inject[i]
+                lane1 = resid_lambdas_attn[i] * lane1 + post_lambdas_attn_ln1[i] * attn_out
+                post_attn = lane0
+                mlp_out = ReLUSqrdMLP(norm(lane1), c_fc, c_proj)
+                lane0 = resid_lambdas_mlp[i] * lane0 + post_lambdas_mlp_ln0[i] * mlp_out
+                lane1 = resid_lambdas_mlp[i] * lane1 + post_lambdas_mlp_ln1[i] * mlp_out
             if i in skip_in:
                 skip_connections.append(post_attn)
             if i == backout_layer:
@@ -1601,6 +1771,13 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # looped transformer config
+    n_loop: int = 1  # recurrence iterations (1 = no looping)
+    recur_start: int = 0  # first layer of recur block (inclusive)
+    recur_end: int = 0  # last layer of recur block (exclusive)
+    bptt_k: int | None = None  # truncate BPTT to last k iterations (None = full backprop)
+    input_injection: str = "passthrough"  # "inject", "inject_random", or "passthrough"
+
 
 args = Hyperparameters()
 
@@ -1669,6 +1846,7 @@ class TrainingSchedule:
             lr = lr * (1 - t) + 0.15 * t
         return lr
 
+
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
     TrainingStage(duration=1/3, train_max_seq_len=896, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
@@ -1734,10 +1912,17 @@ class TrainingManager():
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
+        # Looped transformer params (conditional — only present when n_loop > 1)
+        if hasattr(model, "inject"):
+            self.param_table["inject"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.95], "lr_mul": 1.0, "wd_mul": 0.0}
+        if hasattr(model, "norm_recur"):
+            self.param_table["norm_recur"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.95], "lr_mul": 5.0, "wd_mul": 0.0}
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
+            *(["inject"] if hasattr(model, "inject") else []),
+            *(["norm_recur"] if hasattr(model, "norm_recur") else []),
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
@@ -1917,7 +2102,12 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
+    n_loop=args.n_loop,
+    recur_start=args.recur_start,
+    recur_end=args.recur_end,
+    bptt_k=args.bptt_k,
+    input_injection=args.input_injection,
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -1926,6 +2116,8 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+if hasattr(model, "norm_recur"):
+    model.norm_recur.weight.data = model.norm_recur.weight.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
