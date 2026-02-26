@@ -133,9 +133,9 @@ def build_optimizer(model: LoopedGPT, cfg: TrainConfig) -> NorMuonAdam:
     """Wire up the NorMuon+Adam optimizer for the LoopedGPT model."""
     param_table = {
         "attn_bank": {"optim": "normuon", "comms": "sharded"},
-        "mlp_bank": {"optim": "normuon", "comms": "sharded"},
+        "mlp_up_bank": {"optim": "normuon", "comms": "sharded"},
+        "mlp_down_bank": {"optim": "normuon", "comms": "sharded"},
         "embed": {"optim": "adam", "comms": "sharded", "adam_betas": [0.9, 0.95]},
-        "lm_head": {"optim": "adam", "comms": "sharded", "adam_betas": [0.9, 0.95], "wd_mul": 10.0},
     }
     # Looping modules (conditional)
     if hasattr(model, "inject"):

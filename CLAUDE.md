@@ -12,6 +12,7 @@ Research code — simple, correct, and efficient:
 ## Code Standards
 - Before writing new functions, check existing modules for code that can be extended or reused
 - Type hints on all signatures (modern syntax: `str | None`, `list[int]`)
+- Run ruff after changes: `uv run ruff format . && uv run ruff check --fix .`
 
 ## Package Management (CRITICAL)
 - ALWAYS: `uv add <package>`

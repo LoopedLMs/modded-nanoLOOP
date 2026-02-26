@@ -38,7 +38,8 @@ def norm(x: Tensor) -> Tensor:
 
 
 def next_multiple_of_n(v: float | int, *, n: int) -> int:
-    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+    v_int = int(v) if isinstance(v, float) else v
+    return ((v_int + n - 1) // n) * n
 
 
 # ---------------------------------------------------------------------------
@@ -53,17 +54,20 @@ def softcapped_cross_entropy(
     cap_a: float = 23.0,
     cap_b: float = 5.0,
     cap_c: float = 7.5,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     """Compute cross-entropy with softcapped logits.
 
     ``logits = cap_a * sigmoid((x @ weight.T + cap_b) / cap_c)``
 
     This bounds logits to [0, cap_a], preventing logit explosion while
     preserving gradients throughout the range (from Gemma 2).
+
+    Returns (loss, logits).
     """
     logits = F.linear(x, weight)
     logits = cap_a * torch.sigmoid((logits + cap_b) / cap_c)
-    return F.cross_entropy(logits.float(), targets, reduction="mean")
+    loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+    return loss, logits
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +172,7 @@ class TransformerBlock(nn.Module):
 class LoopedGPTConfig:
     """Configuration for the looped transformer."""
 
-    vocab_size: int = 80  # small for character-level reasoning tasks
+    vocab_size: int = 57  # must match data.reasoning.VOCAB_SIZE
     model_dim: int = 512
     num_heads: int = 8
     head_dim: int = 64  # model_dim // num_heads
@@ -218,11 +222,9 @@ class LoopedGPT(nn.Module):
         self.embed = nn.Embedding(effective_vocab, d)
         self.effective_vocab = effective_vocab
 
-        # --- Output head ---
+        # --- Output head (weight-tied with embedding) ---
         self.lm_head = nn.Linear(d, effective_vocab, bias=False)
-        # Tie weights at init (can be split later if needed)
-        with torch.no_grad():
-            self.lm_head.weight.copy_(self.embed.weight)
+        self.lm_head.weight = self.embed.weight
 
         # --- Parameter banks ---
         # Attention: stores [QKV_concat | O] for each layer
@@ -231,12 +233,15 @@ class LoopedGPT(nn.Module):
         self.attn_bank = nn.Parameter(torch.empty(total_layers, 4 * d, d))
         self.attn_bank.reshape = (total_layers * 4, d, d)
 
-        # MLP: stores [W_up, W_down] for each layer
-        # W_up: (mlp_dim, model_dim), W_down: (model_dim, mlp_dim)
-        # We pad to even number of layers if needed for clean GPU sharding
+        # MLP: W_up (mlp_dim, model_dim) and W_down (model_dim, mlp_dim) stored
+        # separately so W_down is already in the correct layout for F.linear
+        # (avoids per-step .T.contiguous() in the forward loop).
+        # Pad to even number of layers if needed for clean GPU sharding.
         n_mlp_banks = next_multiple_of_n(total_layers, n=2)
-        self.mlp_bank = nn.Parameter(torch.empty(n_mlp_banks, 2, cfg.mlp_dim, d))
-        self.mlp_bank.reshape = (n_mlp_banks * 2, cfg.mlp_dim, d)
+        self.mlp_up_bank = nn.Parameter(torch.empty(n_mlp_banks, cfg.mlp_dim, d))
+        self.mlp_up_bank.reshape = (n_mlp_banks, cfg.mlp_dim, d)
+        self.mlp_down_bank = nn.Parameter(torch.empty(n_mlp_banks, d, cfg.mlp_dim))
+        self.mlp_down_bank.reshape = (n_mlp_banks, d, cfg.mlp_dim)
         self._n_mlp_banks = n_mlp_banks
 
         # Init weights
@@ -244,10 +249,11 @@ class LoopedGPT(nn.Module):
         bound = (3**0.5) * std
         with torch.no_grad():
             self.attn_bank.uniform_(-bound, bound)
-            self.mlp_bank[:total_layers, 0, :, :].uniform_(-bound, bound)  # W_up
-            self.mlp_bank[:total_layers, 1, :, :].zero_()  # W_down (zero init)
+            self.mlp_up_bank[:total_layers].uniform_(-bound, bound)
+            self.mlp_down_bank[:total_layers].zero_()  # zero init
             if n_mlp_banks > total_layers:
-                self.mlp_bank[total_layers:].zero_()  # padding
+                self.mlp_up_bank[total_layers:].zero_()  # padding
+                self.mlp_down_bank[total_layers:].zero_()
 
         # --- Shared transformer blocks ---
         # We use a single TransformerBlock instance for all layers within
@@ -273,25 +279,8 @@ class LoopedGPT(nn.Module):
         attn_w = self.attn_bank[layer_idx]  # (4d, d)
         qkv_w = attn_w[: 3 * d]  # (3d, d)
         o_w = attn_w[3 * d :]  # (d, d)
-        mlp_up_w = self.mlp_bank[layer_idx, 0]  # (mlp_dim, d)
-        # W_down is stored as (mlp_dim, d) but we need (d, mlp_dim) for F.linear
-        # Actually F.linear(x, W) computes x @ W.T, so W_down shape (d, mlp_dim)
-        # But our bank stores (mlp_dim, d), so F.linear(h, W_down) = h @ W_down.T
-        # which is (*, mlp_dim) @ (d, mlp_dim).T = (*, mlp_dim) @ (mlp_dim, d) = (*, d) ✓
-        # Wait — our bank stores (mlp_dim, d). F.linear(h, self.mlp_bank[i,1]) would
-        # compute h @ bank[i,1].T = (*, mlp_dim) @ (d, mlp_dim) — wrong shapes.
-        # We need the down projection weight to be (d, mlp_dim) for F.linear.
-        # Solution: store it transposed OR use a different convention.
-        # Let's keep it simple: bank[i,1] is (mlp_dim, d) = W_down in (out, in) format
-        # But MLP down-proj goes from mlp_dim → d, so weight should be (d, mlp_dim).
-        # So bank[i,1].T gives us (d, mlp_dim) — but .T creates a non-contiguous view.
-        # For simplicity, let's just store both as (larger_dim, smaller_dim) and handle it:
-        mlp_down_w = self.mlp_bank[layer_idx, 1].T  # (d, mlp_dim) for F.linear — wrong
-        # Actually: F.linear(x, w) = x @ w.T. If x is (B,T,mlp_dim) and we want output (B,T,d),
-        # then w must be (d, mlp_dim). So mlp_bank[i,1] must be (d, mlp_dim).
-        # But we stored it as (mlp_dim, d). So we need .T → (d, mlp_dim). Non-contiguous.
-        # Let's just make it contiguous:
-        mlp_down_w = self.mlp_bank[layer_idx, 1].T.contiguous()
+        mlp_up_w = self.mlp_up_bank[layer_idx]  # (mlp_dim, d)
+        mlp_down_w = self.mlp_down_bank[layer_idx]  # (d, mlp_dim) — correct for F.linear
         return qkv_w, o_w, mlp_up_w, mlp_down_w
 
     def forward(self, input_ids: Tensor, targets: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
@@ -333,7 +322,10 @@ class LoopedGPT(nn.Module):
             if has_recurrence:
                 if loop_iter == 0:
                     s = x  # initial state = prelude output
-                # Input injection
+                # Input injection: on loop 0, s == e so inject(cat(e, e)) ≈ e
+                # (identity on first half, zero-init on second half), i.e. a
+                # passthrough.  Subsequent iterations blend prelude output with
+                # the evolving recurrent state.
                 if cfg.input_injection == "inject":
                     x = self.inject(torch.cat([e, s], dim=-1))
                 else:  # passthrough
@@ -361,7 +353,7 @@ class LoopedGPT(nn.Module):
         x = norm(x)
 
         if targets is not None:
-            loss = softcapped_cross_entropy(
+            loss, logits_flat = softcapped_cross_entropy(
                 x.view(-1, x.size(-1)),
                 self.lm_head.weight,
                 targets.view(-1),
@@ -369,7 +361,7 @@ class LoopedGPT(nn.Module):
                 cap_b=cfg.softcap_b,
                 cap_c=cfg.softcap_c,
             )
-            logits = F.linear(x, self.lm_head.weight)
+            logits = logits_flat.view(*x.shape[:-1], -1)
             return loss, logits
         else:
             logits = F.linear(x, self.lm_head.weight)

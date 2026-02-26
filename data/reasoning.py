@@ -239,7 +239,7 @@ class MazeTask(TaskGenerator):
 
     Difficulty controls maze size.
 
-    Example (difficulty=3 → 5×5 maze):
+    Example (difficulty=3 → 7×7 maze, i.e. 3×3 cells with walls):
         Input:  "maze # # # # # , # S . . # , # # # . # , # . . . # , # # # G #"
         Output: "d d r r r d d"  (but with actual shortest path)
     """

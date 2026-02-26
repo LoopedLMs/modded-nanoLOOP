@@ -12,7 +12,7 @@ precision bf16 parameter updates.
 The Polar Express step is the key differentiator: it replaces each gradient
 update with the nearest orthogonal matrix, which stabilises training and
 allows larger learning rates.  It runs entirely in bf16 on-GPU using fused
-Triton kernels (XXT / XTX / ba_plus_cAA) from ``triton_kernels.py``.
+Triton kernels (XXT / XTX / ba_plus_cAA) from ``kernels_triton.py``.
 
 References
 ----------
@@ -363,23 +363,23 @@ class NorMuonAdam:
                 s["mantissa"].zero_()
                 s["second_momentum_buffer"].zero_()
 
-    def state_dict(self):
+    def state_dict(self) -> dict:
         return {
-            "param_states": {id(p): s for p, s in self.param_states.items()},
-            "param_cfgs": {id(p): s for p, s in self.param_cfgs.items()},
+            "param_states": {self.param_cfgs[p].label: s for p, s in self.param_states.items()},
         }
 
-    def load_state_dict(self, state_dict):
-        id_to_param = {id(p): p for p in self.param_cfgs}
-        for param_id, saved in state_dict["param_states"].items():
-            if param_id in id_to_param:
-                param = id_to_param[param_id]
-                cur = self.param_states[param]
-                for k, v in saved.items():
-                    if isinstance(v, torch.Tensor) and k in cur:
-                        cur[k] = v.to(dtype=cur[k].dtype, device=cur[k].device)
-                    else:
-                        cur[k] = v
+    def load_state_dict(self, state_dict: dict) -> None:
+        label_to_param = self._param_by_label
+        for label, saved in state_dict["param_states"].items():
+            if label not in label_to_param:
+                continue
+            param = label_to_param[label]
+            cur = self.param_states[param]
+            for k, v in saved.items():
+                if isinstance(v, torch.Tensor) and k in cur:
+                    cur[k] = v.to(dtype=cur[k].dtype, device=cur[k].device)
+                else:
+                    cur[k] = v
 
     # -----------------------------------------------------------------------
     # Optimizer step
@@ -525,14 +525,22 @@ class NorMuonAdam:
 
         bf16 has only 7 mantissa bits; we store the lower 16 bits of the
         fp32 representation separately so tiny updates accumulate properly.
+
+        NOTE on aliasing: ``p_precise`` is a float32 *view* of ``p_precise_raw``
+        (uint32).  They share the same underlying storage, so mutating
+        ``p_precise`` via ``.copy_()`` also changes ``p_precise_raw``.  The
+        subsequent reads of ``p_precise_raw`` intentionally read the updated
+        bits to extract the new upper/lower 16-bit halves.
         """
         assert p.dtype == mantissa.dtype == torch.uint16
         grad = grad.float()
         wd_factor = wd_tensor.to(torch.float32)
         lr_factor = lr_tensor.to(torch.float32)
         p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        # p_precise is a float32 view aliasing p_precise_raw's storage
         p_precise = p_precise_raw.view(torch.float32)
         mask = (grad * p_precise) >= 0
+        # This mutation updates both p_precise and p_precise_raw (shared storage)
         p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
         p.copy_((p_precise_raw >> 16).to(torch.uint16))
         mantissa.copy_(p_precise_raw.to(torch.uint16))
