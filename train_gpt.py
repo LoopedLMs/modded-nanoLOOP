@@ -2,7 +2,7 @@ import os
 import sys
 
 # Read the current file and the kernels file code ASAP, for logging
-with open(sys.argv[0], 'r') as f:
+with open(sys.argv[0]) as f:
     code = f.read()
 with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') as f:
     code += f"\n\n{'-'*40}\n# triton_kernels.py\n{'-'*40}\n\n"
